@@ -1,0 +1,25 @@
+{
+  "type": "module",
+  "name": "claude-tui",
+  "version": "0.2.0",
+  "description": "Claude Code - Terminal UI Launcher for managing conversation history",
+  "main": "src/main.tsx",
+  "scripts": {
+    "dev": "tsx src/main.tsx",
+    "start": "node dist/main.js",
+    "build": "tsc"
+  },
+  "dependencies": {
+    "ink": "^7.0.3",
+    "react": "^19.0.0"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
