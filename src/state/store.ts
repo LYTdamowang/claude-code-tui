@@ -1,5 +1,6 @@
 import { ProjectEntry, SessionMeta, SessionEntry, FilterState, SortMode, FocusPanel, DialogType, ScanResult, OrphanedProject } from '../data/types.js';
 import { scanAll, loadSessionMessages } from '../data/scanner.js';
+import { autoMigrateOrDelete } from '../actions/session-actions.js';
 
 export interface AppState {
   projects: Map<string, ProjectEntry>;
@@ -24,7 +25,15 @@ export interface AppState {
 }
 
 export function createInitialState(): AppState {
-  const result = scanAll();
+  let result = scanAll();
+
+  if (result.orphanedProjects.size > 0) {
+    const stats = autoMigrateOrDelete(result.orphanedProjects, result.projects);
+    if (stats.migrated > 0 || stats.deleted > 0) {
+      result = scanAll();
+    }
+  }
+
   return buildState(result);
 }
 
@@ -130,7 +139,15 @@ export function loadPreviewForSession(state: AppState): AppState {
 }
 
 export function rescanData(state: AppState): AppState {
-  const result = scanAll();
+  let result = scanAll();
+
+  if (result.orphanedProjects.size > 0) {
+    const stats = autoMigrateOrDelete(result.orphanedProjects, result.projects);
+    if (stats.migrated > 0 || stats.deleted > 0) {
+      result = scanAll();
+    }
+  }
+
   const newState = buildState(result);
 
   // Preserve "新建对话" selection

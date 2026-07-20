@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { exec, execSync } from 'child_process';
-import { SessionMeta } from '../data/types.js';
+import { SessionMeta, OrphanedProject, ProjectEntry } from '../data/types.js';
 import { getArchiveDir, encodePath, getProjectsDir } from '../data/path-codec.js';
 import { loadAllUserAndAssistantMessages } from '../data/scanner.js';
 
@@ -286,4 +286,172 @@ export function migrateProject(oldEncodedDir: string, newPath: string): string |
   }
 
   return null; // success
+}
+
+/**
+ * 从孤项目的 session JSONL 文件中扫描有效的 cwd 路径（备用方案）。
+ */
+function findValidCwdFromSessions(encodedDirName: string): string | null {
+  const projectsDir = getProjectsDir();
+  const projPath = path.join(projectsDir, encodedDirName);
+
+  if (!fs.existsSync(projPath)) return null;
+
+  const candidates = new Map<string, number>();
+
+  try {
+    const files = fs.readdirSync(projPath);
+
+    for (const file of files) {
+      if (!file.endsWith('.jsonl')) continue;
+      const jsonlPath = path.join(projPath, file);
+
+      try {
+        const content = fs.readFileSync(jsonlPath, 'utf-8');
+        const lines = content.trim().split('\n');
+
+        const startIdx = Math.max(0, lines.length - 200);
+        for (let i = lines.length - 1; i >= startIdx; i--) {
+          const line = lines[i].trim();
+          if (!line) continue;
+          try {
+            const entry = JSON.parse(line);
+            if (entry.type === 'user' && entry.cwd && typeof entry.cwd === 'string') {
+              const cwd = entry.cwd.trim();
+              if (cwd && fs.existsSync(cwd)) {
+                candidates.set(cwd, (candidates.get(cwd) || 0) + 1);
+                break;
+              }
+            }
+          } catch { continue; }
+        }
+      } catch { continue; }
+    }
+  } catch { return null; }
+
+  if (candidates.size === 0) return null;
+
+  let bestPath = '';
+  let bestCount = 0;
+  for (const [p, count] of candidates) {
+    if (count > bestCount) {
+      bestCount = count;
+      bestPath = p;
+    }
+  }
+
+  return bestPath || null;
+}
+
+/**
+ * 在文件系统中搜索孤项目可能的新位置。
+ * 规则与 Claude Code 定位会话的逻辑一致——完全基于路径名匹配。
+ * 1. 父目录下找同名目录（大小写变化/临时不可用恢复）
+ * 2. 已知正常项目中找同叶子名的（移到了其他位置）
+ * 3. 父目录下找"旧名为新名子串"的目录（改名：my-app → my-app-v2）
+ * 4. 备用：扫描 session 中记录的 cwd 字段
+ */
+function findValidPathForOrphan(
+  oldPath: string,
+  encodedDirName: string,
+  allProjects: Map<string, ProjectEntry>,
+): string | null {
+  const leaf = path.basename(oldPath);
+  const parent = path.dirname(oldPath);
+  const leafLower = leaf.toLowerCase();
+
+  // 1. 同父目录下找同名目录（大小写变化/临时不可用恢复）
+  if (fs.existsSync(parent)) {
+    try {
+      for (const entry of fs.readdirSync(parent, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        const candidate = path.join(parent, entry.name);
+        if (entry.name.toLowerCase() === leafLower && path.resolve(candidate) !== path.resolve(oldPath)) {
+          return candidate;
+        }
+      }
+    } catch { /* permission error */ }
+  }
+
+  // 2. 在所有已知正常项目中找同叶子名的
+  for (const [projPath] of allProjects) {
+    if (path.basename(projPath).toLowerCase() === leafLower && path.resolve(projPath) !== path.resolve(oldPath)) {
+      return projPath;
+    }
+  }
+
+  // 3. 父目录下找"旧名是新名子串"的目录（my-app → my-app-v2 / old-my-app）
+  //    只匹配长度 >= 3 的旧名，避免短名误匹配
+  if (leaf.length >= 3 && fs.existsSync(parent)) {
+    try {
+      for (const entry of fs.readdirSync(parent, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        const nameLower = entry.name.toLowerCase();
+        if (nameLower === leafLower) continue; // 已在步骤1处理
+        if (nameLower.includes(leafLower)) {
+          return path.join(parent, entry.name);
+        }
+      }
+    } catch { /* permission error */ }
+  }
+
+  // 4. 备用：从 session cwd 字段查找
+  return findValidCwdFromSessions(encodedDirName);
+}
+
+/**
+ * 删除整个孤项目目录。
+ */
+function deleteProjectDir(encodedDirName: string): boolean {
+  const projectsDir = getProjectsDir();
+  const projPath = path.join(projectsDir, encodedDirName);
+
+  if (!fs.existsSync(projPath)) return true;
+
+  try {
+    fs.rmSync(projPath, { recursive: true, force: true });
+    return !fs.existsSync(projPath);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 自动迁移孤项目 + 清理完全失效的项目。
+ * - 在文件系统中搜索同名/相似名目录尝试自动迁移
+ * - 四个策略都找不到有效路径 → 项目彻底消失 → 自动删除
+ * - 迁移失败（如目标已存在项目）→ 跳过，保留为孤项目
+ * 返回处理统计
+ */
+export function autoMigrateOrDelete(
+  orphanedProjects: Map<string, OrphanedProject>,
+  allProjects: Map<string, ProjectEntry>,
+): { migrated: number; deleted: number; skipped: number } {
+  let migrated = 0;
+  let deleted = 0;
+  let skipped = 0;
+
+  for (const [encodedName, op] of orphanedProjects) {
+    const validPath = findValidPathForOrphan(op.oldPath, encodedName, allProjects);
+
+    if (!validPath || validPath === op.oldPath) {
+      // 四个策略都找不到有效路径 → 项目彻底消失 → 删除
+      if (deleteProjectDir(encodedName)) {
+        deleted++;
+      } else {
+        skipped++;
+      }
+      continue;
+    }
+
+    const err = migrateProject(encodedName, validPath);
+    if (err === null) {
+      migrated++;
+    } else {
+      // 迁移失败（如目标已有项目目录）→ 保留，不删除
+      skipped++;
+    }
+  }
+
+  return { migrated, deleted, skipped };
 }
